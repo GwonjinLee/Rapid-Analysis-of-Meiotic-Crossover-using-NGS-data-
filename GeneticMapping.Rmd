@@ -1,0 +1,2221 @@
+---
+title: "Linkage Mapping and recombination rate calculation"
+author: "Gwonjin Lee"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+
+#setRepositories(ind = 1:2)
+#install.packages("onemap", dependencies=TRUE)
+
+#Instaling RSamtolls package
+#source("https://bioconductor.org/biocLite.R")
+
+library(onemap)
+library(stringr)
+library(Rsamtools)
+library(plyr)
+library(LinkageMapView)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(qtl)
+library(ASMap)
+library(gifski)
+library(rlist)
+library(Rmisc)
+library(ggpubr)
+library(reshape)
+library(agricolae)
+library(car)
+library(FSA)
+library(vcfR)
+library(eulerr)
+library(rJava)
+library(venneuler)
+
+```
+
+# hmp reformatting
+
+```{r}
+
+########################################################################################################################
+# Use the same script for other lines after replacing the line names
+########################################################################################################################
+
+## B97 
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+
+#ref <- ape::read.dna("../../../genome/Zm-B73-REFERENCE-NAM-5.0.fa", format = "fasta")
+#gff <-  read.table("../../genome/Zm-B73-REFERENCE-NAM-5.0_Zm00001eb.1.gff3", sep="\t", quote="")
+
+
+B97_vcf <- read.vcfR("B97_filtered.recode.vcf", verbose = F)
+
+
+
+B97_hmp <- vcfR2hapmap(B97_vcf )[-1,]
+
+# Change the name of genotypes
+names(B97_hmp) <- gsub(x = names(B97_hmp), pattern = ".sort", replacement = "")  
+names(B97_hmp) <- gsub(x = names(B97_hmp), pattern = "_1_", replacement = "_")
+
+
+B97_filter <- B97_hmp %>% 
+  as_tibble() %>% 
+  mutate(duplicates = if_else(B73_parent == B97_parent,
+                              TRUE,
+                              FALSE)) %>% 
+  filter(duplicates == FALSE) %>% #Delete markers that have same alleles between parents
+  subset(B73_parent == "AA" | B73_parent == "GG" | B73_parent == "CC" | B73_parent == "TT" ) %>%
+  subset(B97_parent == "AA" | B97_parent == "GG" | B97_parent == "CC" | B97_parent == "TT" ) #Omit heterozygous SNPs of parental lines
+
+
+B97_filter <- B97_filter[,-ncol(B97_filter) ]
+
+
+#write_delim(B97_filter, "B97_filteredR.hmp.txt", delim = "\t", quote = "none")
+
+###########################################################
+#Filter genotypes based on max missingness, split into female and male, and reformat to ABH in Tassel
+#Convert alternative homozygous alleles to NA in ABH form
+
+
+
+```
+
+# ABH data cleaning and genetic mapping
+
+## B97F mapping
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+if (!dir.exists("plot")) {dir.create("plot")}
+if (!dir.exists("plot/genotype")) {dir.create("plot/genotype")}
+if (!dir.exists("plot/genotype/F")) {dir.create("plot/genotype/F")}
+if (!dir.exists("plot/genotype/M")) {dir.create("plot/genotype/M")}
+
+## R/qtl
+#install.packages("ASMap")
+
+# Before this, remove "NA" in the second row in the first column, and replace "id" in the first column and row to "Genotype"
+# Replace B to NA for masking alternative homogozygous alleles to missing data.
+# Delete scaffolds if exists
+
+## Load ABH file
+B97F <- read.cross("csv", "./", "B97F_ABH.csv", estimate.map=FALSE, crosstype = "bc")
+
+summary(B97F)
+
+
+# plot genotypic data using geno.image before filtering
+
+png(filename="plot/genotype/F/B97F_geno_beforefiltering.png", width =10, height =8, units = 'in', res = 300)
+# setting graphical parameters.
+par(cex.axis=1, cex.lab=1.5,font.axis=2,font.lab=2,col.axis='darkblue',col.lab="black") 
+par(mgp=c(2.3,0.8,0))
+par(mar=c(4,4,6,1))
+# plot before error correction (BC), color = AA:red, AB:blue, BB:green
+plot_BC_before<-
+geno.image(B97F,alternate.chrid=TRUE,main="B97F genotypes before cleaning",xlab="Markers",ylab="Genotypes")
+dev.off()
+
+
+
+# Histogram of number of matching genotypes be plotted in R/qtl
+png("plot/Comparing_genotypes.png", units="in", width =6, height =6, bg="white", res=300) 
+cg <- comparegeno(B97F)
+par(mar=c(3,3,1.2,1.2), mgp=c(1.8,0.4,0))
+hist(cg, breaks=seq(0, 1, len=53), main="",xlab="Matching 
+genotypes",ylab="Frequency", col="pink", col.axis="darkblue", cex.axis=1, cex.lab=1.3, 
+col.lab="black",font.axis=2, font.lab=2)
+rug(cg, col="blue")
+dev.off()
+
+
+#Check markers for excessive segregation distortion (Create table showing the observed numbers of individuals with each genotype at each marker, including P-values from chi-square tests for Mendelian segregation).
+gt <- geno.table(B97F)
+gt[gt$P.value < 0.01,]
+gt[gt$P.value < 0.01/totmar(B97F),]
+# drop significant distorted markers
+todrop <- rownames(gt[gt$P.value < 0.01,])
+#write.csv(todrop, file="B97F_SD_markers.csv")
+B97F2<-drop.markers(B97F,todrop)
+summary(B97F2)
+
+
+#check markers for switched alleles
+#checkAlleles(B97F3, threshold=3) 
+
+# Marker profile and statistics in R/ASMaplibrary for checking genotyping errors
+
+# Linkage map statistics across the markers
+stat_markers<-statMark(B97F2, stat.type = c("marker"), map.function = "kosambi")
+head(stat_markers$marker)
+#write.csv(stat_markers, file="stat_markers.csv") # Save the marker statistics file
+
+
+# visualize marker profile showing segregation distortion (seg.dist), double crossovers(dxo), 
+#estimated recombination fraction (erf), and LOD score (lod) for each marker
+
+profileMark(B97F2, stat.type = c("seg.dist", "dxo", "erf", "lod"), id = "Genotype", 
+            layout = c(1, 4), type = "l", cex=2.5, cex.axis=2, cex.lab=2) 
+
+#Dropping the markers with elevated number of dxo using drop.markers function
+B97F3 <- markernames(B97F2,)[statMark(B97F2, stat.type ="marker")$marker$dxo>10]
+B97F3<-drop.markers(B97F2, B97F3)
+B97F3
+
+# Linkage map statistics across the genotypes
+stat_genotype<- statGen(B97F3, bychr = FALSE, stat.type = c("dxo"))
+stat_genotype
+#write.csv(stat_genotype, file="stat_genotype_dxo.csv")
+
+# visualize genotype profile showing number double crossovers (dxo) and missing proportion (miss) in each genotype
+profileGen(B97F3, bychr = FALSE, stat.type = "dxo", id ="Genotype", lty = 20) 
+
+# Make snps that has less than 10 between two crossovers to NA
+B97F4 <- cleanGeno(B97F3, chr= c(1:10), maxdist=1000000, maxmark=10) # for one single option for all chrs
+B97F4
+
+#profileGen(B97F4, bychr = FALSE, stat.type = "dxo", id ="Genotype", lty = 20) 
+
+nmar(B97F4)
+geno.image(B97F4,alternate.chrid=TRUE,main="B97F genotypes after filtering",xlab="Markers",ylab="Genotypes")
+
+####### Need to optimize options for final mapping !!!! ####### 
+
+#plot genotypic data using geno.image after filtering
+png(filename="plot/genotype/F/B97F_geno_filtered.png", width =10, height =8, units = 'in', res = 300)
+par(cex.axis=1, cex.lab=1.5,font.axis=2,font.lab=2,col.axis='darkblue',col.lab="black") 
+par(mgp=c(2.3,0.8,0))
+par(mar=c(4,4,6,1))
+plot_AF<-
+geno.image(B97F4,alternate.chrid=TRUE,main="B97F genotypes after filtering",xlab="Markers",ylab="Genotypes")
+dev.off()
+
+
+
+###################################################################################################################################
+
+## Imputation using fill.geno with argmax (Viterbi algorithm for Hidden Markov model)
+
+B97F_filled_argmax <- fill.geno(B97F4, method ="argmax" ) # check also other methods
+
+geno.image(B97F_filled_argmax,alternate.chrid=TRUE,main="B97F genotypes after imputation (argmax)",xlab="Markers",ylab="Genotypes")
+
+
+#plot genotypic data using geno.image after imputation
+
+png(filename="plot/genotype/F/B97F_geno_imputed.png", width =10, height =8, units = 'in', res = 300)
+
+par(cex.axis=1, cex.lab=1.5,font.axis=2,font.lab=2,col.axis='darkblue',col.lab="black") 
+par(mgp=c(2.3,0.8,0))
+par(mar=c(4,4,6,1))
+plot_Imp_arg<-
+geno.image(B97F_filled_argmax, alternate.chrid=TRUE,main="B97F genotypes after imputation",xlab="Markers",ylab="Genotypes")
+dev.off()
+
+# generate gif
+png_files <- list.files( "plot/genotype/F/",  pattern = ".*png$", full.names = TRUE)
+gifski(png_files, gif_file = "plot/genotype/F/B97F_geno_all.gif", width = 1000, height = 800, delay = 2)
+
+## save the Data file for final linkage map construction
+#write.cross(B97F_filled_argmax, file="B97F_imputed", format = "csv")
+
+#B97F_rf_argmax <- est.rf(B97F_filled_argmax)
+
+B97F_argmaxmap <- est.map(B97F_filled_argmax, map.function = "kosambi", sex.sp = F )
+tail(B97F_argmaxmap$`1`)
+plot(B97F_argmaxmap)
+
+# save the map after changing the ylim depending on the length of chr1
+png(filename = "plot/B97F_map_230.png", width = 7, height = 6, units = "in",  res = 300 )
+plot.map(B97F_argmaxmap, ylim= c(230,0), main = "B97F" )
+dev.off()
+
+B97F_maptable_arg <- map2table(B97F_argmaxmap)
+#write.table(B97F_maptable_arg, file = "B97F_maptable.txt", sep = "\t", col.names = F, quote = F )
+
+```
+
+################################################################################################################################### 
+
+## B97F crossover
+
+```{r}
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+# Make a cross file with phycial position for crossover analysis
+B97F_imputed <- read.csv("B97F_imputed.csv")
+B97F_imputed_t <- t(B97F_imputed)
+B97F_imputed_t <- tibble::rownames_to_column(as.data.frame(B97F_imputed_t), "phy")
+B97F_imputed_t$V2 <- sub(".*_", "", B97F_imputed_t$phy)
+B97F_imputed_t$V2 <- sub("Genotype", "", B97F_imputed_t$V2) 
+B97F_phy <- t(B97F_imputed_t)
+write.table(B97F_phy, "B97F_phy.csv", sep = ",", row.names = F, col.names = F )
+
+# Estimate the locations of crossovers for each individual on a given chromosome
+# Load the cross_phy file after adding physical position info in the third row in imputed cross file
+
+B97F_cross_phy <- read.cross("csv", "./", "B97F_phy.csv", genotypes = c("AA", "AB") )
+
+B97F_xoloc_0 <- locateXO(B97F_cross_phy, chr = 1, full.info= T)
+summary(B97F_xoloc_0)
+capture.output(B97F_xoloc_0, file = "B97F_breakpoint_LRend_phy.txt")
+
+
+B97F_xoloc_1 <- locateXO(B97F_cross_phy, chr = 1, full.info= F)
+table(sapply(B97F_xoloc_1, length))
+
+B97F_xoloc_t1 <- as.data.frame(t(t(B97F_xoloc_1)))
+B97F_xoloc_t1$V1 <- as.character(B97F_xoloc_t1$V1)
+colnames(B97F_xoloc_t1) <- "chr1"
+B97F_xoloc_in <- B97F_xoloc_t1
+
+
+for (i in 1:10) {
+  B97F_xoloc <- locateXO(B97F_cross_phy, chr = i, full.info= F)
+B97F_xoloc_t <- as.data.frame(t(t(B97F_xoloc)))
+B97F_xoloc_t$V1 <- as.character(B97F_xoloc_t$V1)
+colnames(B97F_xoloc_t) <- c(paste("chr", i, sep=""))
+df <- as.data.frame(B97F_xoloc_t)
+B97F_xoloc_in <- cbind(B97F_xoloc_in, df)
+}
+
+B97F_xoall <- as.data.frame(B97F_xoloc_in[,-1])
+
+B97F_xoall2 <- data.frame(lapply(B97F_xoall, function(x) {
+                  gsub("[c(]", "", x)
+              }))
+
+B97F_xoall3 <- data.frame(lapply(B97F_xoall2, function(x) {
+                  gsub("[)]", "", x)
+              }))
+
+B97F_xoall4 <- data.frame(lapply(B97F_xoall3, function(x) {
+                  gsub("numeri0", "", x)
+              }))
+rownames(B97F_xoall4) <- B97F4$pheno$Genotype
+
+# write.csv( B97F_xoall4 , file="B97F_breakpoint_phy.csv")
+
+############
+
+# Convert dataframe for each breakpoint
+B97F_xoall45 <- read.csv("B97F_breakpoint_phy.csv", row.names = 1)
+
+B97F_xoall5 <- rownames_to_column(B97F_xoall45, var = "genotype")
+
+
+B97F_xoall6 <- B97F_xoall5 %>% 
+  pivot_longer(cols = -genotype, names_to = "chromosome") %>% 
+  separate_rows(value, sep = ",") %>% 
+  filter(value != "") %>% 
+  mutate(breakpoint = round(as.numeric(value))) %>%
+  select(-3)
+
+#write.csv( B97F_xoall6 , file="B97F_eachbreakpoint.csv" , row.names = F )
+
+
+
+
+#Count the number of obligate crossovers for each individual
+B97F_nxo <- countXO(B97F_filled_argmax, bychr = T)
+row.names(B97F_nxo) <- B97F4$pheno$Genotype
+#write.csv( B97F_nxo , file="B97F_numberCO.csv") #need to re-load genotype names
+
+
+
+
+```
+
+###################################################################################################################################### 
+
+## B97M mapping
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+
+# Before this, remove "NA" in the second row in the first column, and replace "id" in the first column and row to "Genotype"
+# Replace B to NA for masking alternative homogozygous alleles to missing data.
+
+## Load ABH file
+B97M <- read.cross("csv", "./", "B97M_ABH.csv", estimate.map=FALSE, crosstype = "bc")
+
+summary(B97M)
+
+
+# plot genotypic data using geno.image before filtering
+
+png(filename="plot/genotype/M/B97M_geno_beforefiltering.png", width =10, height =8, units = 'in', res = 300)
+# setting graphical parameters.
+par(cex.axis=1, cex.lab=1.5,font.axis=2,font.lab=2,col.axis='darkblue',col.lab="black") 
+par(mgp=c(2.3,0.8,0))
+par(mar=c(4,4,6,1))
+# plot before error correction (BC), color = AA:red, AB:blue, BB:green
+plot_BC_before<-
+geno.image(B97M,alternate.chrid=TRUE,main="B97M genotypes before cleaning",xlab="Markers",ylab="Genotypes")
+dev.off()
+
+
+
+# Histogram of number of matching genotypes be plotted in R/qtl
+png("plot/Comparing_genotypes.png", units="in", width =6, height =6, bg="white", res=300) 
+cg <- comparegeno(B97M)
+par(mar=c(3,3,1.2,1.2), mgp=c(1.8,0.4,0))
+hist(cg, breaks=seq(0, 1, len=53), main="",xlab="Matching 
+genotypes",ylab="Frequency", col="pink", col.axis="darkblue", cex.axis=1, cex.lab=1.3, 
+col.lab="black",font.axis=2, font.lab=2)
+rug(cg, col="blue")
+dev.off()
+
+
+#Check markers for excessive segregation distortion (Create table showing the observed numbers of individuals with each genotype at each marker, including P-values from chi-square tests for Mendelian segregation).
+gt <- geno.table(B97M)
+gt[gt$P.value < 0.01,]
+gt[gt$P.value < 0.01/totmar(B97M),]
+# drop significant distorted markers
+todrop <- rownames(gt[gt$P.value < 0.01,])
+#write.csv(todrop, file="B97M_SD_markers.csv")
+B97M2<-drop.markers(B97M,todrop)
+summary(B97M2)
+
+
+#check markers for switched alleles
+#checkAlleles(B97M3, threshold=3) 
+
+# Marker profile and statistics in R/ASMaplibrary for checking genotyping errors
+
+# Linkage map statistics across the markers
+stat_markers<-statMark(B97M2, stat.type = c("marker"), map.function = "kosambi")
+head(stat_markers$marker)
+#write.csv(stat_markers, file="stat_markers.csv") # Save the marker statistics file
+
+
+# visualize marker profile showing segregation distortion (seg.dist), double crossovers(dxo), 
+#estimated recombination fraction (erf), and LOD score (lod) for each marker
+
+profileMark(B97M2, stat.type = c("seg.dist", "dxo", "erf", "lod"), id = "Genotype", 
+            layout = c(1, 4), type = "l", cex=2.5, cex.axis=2, cex.lab=2) 
+
+#Dropping the markers with elevated number of dxo using drop.markers function
+B97M3 <- markernames(B97M2,)[statMark(B97M2, stat.type ="marker")$marker$dxo>10]
+B97M3<-drop.markers(B97M2, B97M3)
+B97M3
+
+# Linkage map statistics across the genotypes
+stat_genotype<- statGen(B97M3, bychr = FALSE, stat.type = c("dxo"))
+stat_genotype
+#write.csv(stat_genotype, file="stat_genotype_dxo.csv")
+
+# visualize genotype profile showing number double crossovers (dxo) and missing proportion (miss) in each genotype
+profileGen(B97M3, bychr = FALSE, stat.type = "dxo", id ="Genotype", lty = 20) 
+
+# Make snps that has less than 10 between two crossovers to NA
+B97M4 <- cleanGeno(B97M3, chr= c(1:10), maxdist=1000000, maxmark=10) # for one single option for all chrs
+B97M4
+
+#profileGen(B97M4, bychr = FALSE, stat.type = "dxo", id ="Genotype", lty = 20) 
+
+nmar(B97M4)
+geno.image(B97M4,alternate.chrid=TRUE,main="B97M genotypes after filtering",xlab="Markers",ylab="Genotypes")
+
+####### Need to optimize options for final mapping !!!! ####### 
+
+#plot genotypic data using geno.image after filtering
+png(filename="plot/genotype/M/B97M_geno_filtered.png", width =10, height =8, units = 'in', res = 300)
+par(cex.axis=1, cex.lab=1.5,font.axis=2,font.lab=2,col.axis='darkblue',col.lab="black") 
+par(mgp=c(2.3,0.8,0))
+par(mar=c(4,4,6,1))
+plot_AF<-
+geno.image(B97M4,alternate.chrid=TRUE,main="B97M genotypes after filtering",xlab="Markers",ylab="Genotypes")
+dev.off()
+
+
+
+###################################################################################################################################
+
+## Imputation using fill.geno with argmax (Viterbi algorithm for Hidden Markov model)
+
+B97M_filled_argmax <- fill.geno(B97M4, method ="argmax" ) # check also other methods
+
+geno.image(B97M_filled_argmax,alternate.chrid=TRUE,main="B97M genotypes after imputation (argmax)",xlab="Markers",ylab="Genotypes")
+
+
+#plot genotypic data using geno.image after imputation
+
+png(filename="plot/genotype/M/B97M_geno_imputed.png", width =10, height =8, units = 'in', res = 300)
+
+par(cex.axis=1, cex.lab=1.5,font.axis=2,font.lab=2,col.axis='darkblue',col.lab="black") 
+par(mgp=c(2.3,0.8,0))
+par(mar=c(4,4,6,1))
+plot_Imp_arg<-
+geno.image(B97M_filled_argmax, alternate.chrid=TRUE,main="B97M genotypes after imputation",xlab="Markers",ylab="Genotypes")
+dev.off()
+
+# generate gif
+png_files <- list.files( "plot/genotype/M",  pattern = ".*png$", full.names = TRUE)
+gifski(png_files, gif_file = "plot/genotype/M/B97M_geno_all.gif", width = 1000, height = 800, delay = 2)
+
+## save the Data file for final linkage map construction
+#write.cross(B97M_filled_argmax, file="B97M_imputed", format = "csv")
+
+#B97M_rf_argmax <- est.rf(B97M_filled_argmax)
+
+B97M_argmaxmap <- est.map(B97M_filled_argmax, map.function = "kosambi", sex.sp = F )
+tail(B97M_argmaxmap$`1`)
+plot(B97M_argmaxmap)
+
+# save the map after changing the ylim depending on the length of chr1
+png(filename = "plot/B97M_map_230.png", width = 7, height = 6, units = "in",  res = 300 )
+plot.map(B97M_argmaxmap, ylim= c(230,0), main = "B97M" )
+dev.off()
+
+B97M_maptable_arg <- map2table(B97M_argmaxmap)
+#write.table(B97M_maptable_arg, file = "B97M_maptable.txt", sep = "\t", col.names = F, quote = F )
+
+
+```
+
+################################################################################################################################### 
+
+## B97M crossover
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+# Make a cross file with phycial position for crossover analysis
+B97M_imputed <- read.csv("B97M_imputed.csv")
+B97M_imputed_t <- t(B97M_imputed)
+B97M_imputed_t <- tibble::rownames_to_column(as.data.frame(B97M_imputed_t), "phy")
+B97M_imputed_t$V2 <- sub(".*_", "", B97M_imputed_t$phy)
+B97M_imputed_t$V2 <- sub("Genotype", "", B97M_imputed_t$V2) 
+B97M_phy <- t(B97M_imputed_t)
+#write.table(B97M_phy, "B97M_phy.csv", sep = ",", row.names = F, col.names = F )
+
+
+# Estimate the locations of crossovers for each individual on a given chromosome
+# Load the cross_phy file after adding physical position info in the third row in imputed cross file
+
+B97M_cross_phy <- read.cross("csv", "./", "B97M_phy.csv", genotypes = c("AA", "AB") )
+
+B97M_xoloc_0 <- locateXO(B97M_cross_phy, chr = 1, full.info= T)
+summary(B97M_xoloc_0)
+capture.output(B97M_xoloc_0, file = "B97M_breakpoint_LRend_phy.txt")
+
+
+B97M_xoloc_1 <- locateXO(B97M_cross_phy, chr = 1, full.info= F)
+table(sapply(B97M_xoloc_1, length))
+
+B97M_xoloc_t1 <- as.data.frame(t(t(B97M_xoloc_1)))
+B97M_xoloc_t1$V1 <- as.character(B97M_xoloc_t1$V1)
+colnames(B97M_xoloc_t1) <- "chr1"
+B97M_xoloc_in <- B97M_xoloc_t1
+
+
+for (i in 1:10) {
+  B97M_xoloc <- locateXO(B97M_cross_phy, chr = i, full.info= F)
+B97M_xoloc_t <- as.data.frame(t(t(B97M_xoloc)))
+B97M_xoloc_t$V1 <- as.character(B97M_xoloc_t$V1)
+colnames(B97M_xoloc_t) <- c(paste("chr", i, sep=""))
+df <- as.data.frame(B97M_xoloc_t)
+B97M_xoloc_in <- cbind(B97M_xoloc_in, df)
+}
+
+B97M_xoall <- as.data.frame(B97M_xoloc_in[,-1])
+
+B97M_xoall2 <- data.frame(lapply(B97M_xoall, function(x) {
+                  gsub("[c(]", "", x)
+              }))
+
+B97M_xoall3 <- data.frame(lapply(B97M_xoall2, function(x) {
+                  gsub("[)]", "", x)
+              }))
+
+B97M_xoall4 <- data.frame(lapply(B97M_xoall3, function(x) {
+                  gsub("numeri0", "", x)
+              }))
+rownames(B97M_xoall4) <- B97M4$pheno$Genotype
+
+#write.csv( B97M_xoall4 , file="B97M_breakpoint_phy.csv")
+
+
+############
+
+# Convert dataframe for each breakpoint
+
+B97M_xoall45 <- read.csv("B97M_breakpoint_phy.csv", row.names = 1)
+
+B97M_xoall5 <- rownames_to_column(B97M_xoall45, var = "genotype")
+
+
+B97M_xoall6 <- B97M_xoall5 %>% 
+  pivot_longer(cols = -genotype, names_to = "chromosome") %>% 
+  separate_rows(value, sep = ",") %>% 
+  filter(value != "") %>% 
+  mutate(breakpoint = round(as.numeric(value))) %>%
+  select(-3)
+
+#write.csv( B97M_xoall6 , file="B97M_eachbreakpoint.csv" , row.names = F )
+
+
+
+##############
+
+
+#Count the number of obligate crossovers for each individual
+B97M_nxo <- countXO(B97M_filled_argmax, bychr = T)
+row.names(B97M_nxo) <- B97M4$pheno$Genotype
+write.csv( B97M_nxo , file="B97M_numberCO.csv") #need to re-load genotype names
+
+
+```
+
+######################################################################################################################## 
+
+# MareyMap
+
+```{r}
+
+
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+# Need to format the Mareymap input file using a map file from r/qtl
+## B97F
+B97F_maptable <- tibble::rownames_to_column(B97F_maptable_arg, "mkr")
+B97F_maptable$phys <- sub(".*_", "", B97F_maptable$mkr)
+B97F_maptable$set <- "B97F"
+B97F_maptable$chr <- sub("^", "Chromosome ", B97F_maptable$chr)
+colnames(B97F_maptable)[c(2,3)] <- c("map", "gen")
+B97F_maptable <- B97F_maptable[,c("set", "map", "mkr", "phys", "gen")]
+B97F_maptable$phys <- as.numeric(B97F_maptable$phys)
+write_delim(B97F_maptable, "B97F_mareyinput.txt",  delim = "\t", quote = "all")
+
+## B97M
+B97M_maptable <- tibble::rownames_to_column(B97M_maptable_arg, "mkr")
+B97M_maptable$phys <- sub(".*_", "", B97M_maptable$mkr)
+B97M_maptable$set <- "B97M"
+B97M_maptable$chr <- sub("^", "Chromosome ", B97M_maptable$chr)
+colnames(B97M_maptable)[c(2,3)] <- c("map", "gen")
+B97M_maptable <- B97M_maptable[,c("set", "map", "mkr", "phys", "gen")]
+B97M_maptable$phys <- as.numeric(B97M_maptable$phys)
+write_delim(B97M_maptable, "B97M_mareyinput.txt",  delim = "\t", quote = "all")
+
+#remotes::install_github("aursiber/MareyMap")
+library(MareyMap)
+startMareyMapGUI()
+
+#B97F_mareyinput <-  read.table("B97F_mareyinput.txt",  sep = "\t" , header = TRUE)
+#B97F_d <- MareyMap(B97F_mareyinput) #not working
+
+#Chr-specific spar option
+
+# chr1		0.28
+# chr2		0.36
+# chr3		0.37
+# chr4		0.34
+# chr5		0.38
+# chr6		0.44
+# chr7		0.42
+# chr8		0.44
+# chr9		0.48
+# chr10 	0.53
+
+
+```
+
+
+# Genreal hotspot
+
+```{r}
+
+# Use mareymap output using chr-specific spline
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+peri <- read.csv("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/CO/ZmB73V5_heterochromatin regions.csv")
+
+B97_all <- read.table("B97_mareyout.chr_snp.txt", sep = " " , header = TRUE )
+B97_all$Mb <- B97_all$phys/1000000
+
+str(B97_all)
+colnames(B97_all)[2] <- "chr" 
+B97_all$chr <- sub("Chromosome ", "", B97_all$chr)
+class(B97_all$chr)
+
+B97_all$chr <- as.integer(B97_all$chr)
+
+B97_all_d <- melt(B97_all,id.vars = c(1:6, 8), measure.vars = 7)
+
+colnames(B97_all_d)[8:9] <- c("option", "rate")
+
+
+B97_all_d$rate[B97_all_d$rate < 0] <- 0
+
+#B97F
+
+# calculate genome average for recombination rates
+
+# First, filter the data to keep only the variables needed for the plot
+
+B97F_recomb0 <- subset(B97_all_d, set == "B97F")
+
+B97F_recomb <- subset(B97F_recomb0, option == "spline")  %>%
+  select(chr, phys, rate)
+
+
+# hotspot using recombination rates (adjust window size!) 
+
+# Group the breakpoints by chromosome and window (0.2Mb)
+B97F_phys_grouped <- B97F_recomb %>%
+  group_by(chr) %>%
+  mutate(window = ceiling(phys / 200000)) %>%
+  group_by(window, .add = TRUE)
+
+
+# First, remove the NA values from the "rate" column.
+B97F_phys_grouped <- B97F_phys_grouped[!is.na(B97F_phys_grouped$rate), ]
+
+# Group by "chr" and "window", and calculate the average rate per group.
+B97F_mean_recomb_perwin <- B97F_phys_grouped %>%
+  dplyr::group_by(chr, window) %>%
+  dplyr::summarize(mean_recomb = mean(rate))
+
+
+
+###################
+
+
+### hotspot using genome average
+
+# Calculate mean genome average recombination rates and the cutoff for hotspot detection
+B97F_genome_recomb_rate <- mean(subset(B97_all_d, option == "spline")$rate, na.rm = T )
+B97F_genome_recomb_rate
+
+B97F_recombhotspot_cutoff <- 5 * B97F_genome_recomb_rate  #5-fold higher than genome average
+B97F_recombhotspot_cutoff
+
+# Identify the hotspots with mean recomnination rates 
+B97F_recomb_hot_genome <- B97F_mean_recomb_perwin %>%
+  ungroup() %>%
+  group_by(chr, window) %>%
+  filter(mean_recomb >= B97F_recombhotspot_cutoff)
+
+B97F_recomb_hot_genome$chr_Window <- paste(B97F_recomb_hot_genome$chr, B97F_recomb_hot_genome$window, sep = "_")
+
+dim(B97F_recomb_hot_genome)
+
+write.csv(B97F_recomb_hot_genome, "hotspot/B97F_recomb_hot_genome_0.2mb_5fold.csv", row.names = F )
+
+
+
+#Plot only for chr-specific spar options
+
+B97F_recom_chr <- ggplot() +
+    geom_rect( data=peri, aes(xmin=Start_Mb, xmax=End_Mb), ymin=-Inf, ymax=Inf, 
+    alpha = 0.3, fill = 'grey') +
+  geom_line(data = subset(B97_all_d, set == "B97F"), 
+            aes(x= Mb, y= rate), alpha =0.9, lwd =0.5, col = "red") +
+  facet_wrap(  ~ chr, ncol = 2, scales = "free") +
+  theme_bw() +
+  labs(x= "Physical positions (Mb)" ,
+       y="Recombination rates (cM/Mb)", title="Chr-specific spline for B97F") +
+  theme(axis.text.y=element_text(size=8),axis.text.x=element_text(size=12),
+          axis.title=element_text(size=15), strip.text = element_text(size=12),
+        strip.background = element_blank(),
+        strip.text.y.left = element_text(angle = 0), legend.position = "none" ) +
+  theme(panel.grid.major = element_blank()) +
+  theme(panel.grid.minor = element_blank()) +
+  geom_hline(yintercept = B97F_recombhotspot_cutoff, linetype = "dashed", color = "grey40")
+
+
+png(filename = "plot/B97F_recom_chr_snp.png", width = 7, height = 7, units = "in",  res = 500 )
+B97F_recom_chr
+dev.off()
+
+
+
+
+#########################
+
+
+#B97M
+
+# calculate genome average for recombination rates
+
+# First, filter the data to keep only the variables needed for the plot
+
+B97M_recomb0 <- subset(B97_all_d, set == "B97M")
+
+B97M_recomb <- subset(B97M_recomb0, option == "spline")  %>%
+  select(chr, phys, rate)
+
+
+# hotspot using recombination rates (adjust window size!) 
+
+# Group the breakpoints by chromosome and window (0.2Mb)
+B97M_phys_grouped <- B97M_recomb %>%
+  group_by(chr) %>%
+  mutate(window = ceiling(phys / 200000)) %>%
+  group_by(window, .add = TRUE)
+
+
+# First, remove the NA values from the "rate" column.
+B97M_phys_grouped <- B97M_phys_grouped[!is.na(B97M_phys_grouped$rate), ]
+
+# Group by "chr" and "window", and calculate the average rate per group.
+B97M_mean_recomb_perwin <- B97M_phys_grouped %>%
+  dplyr::group_by(chr, window) %>%
+  dplyr::summarize(mean_recomb = mean(rate))
+
+
+
+###################
+
+
+### hotspot using genome average
+
+# Calculate mean genome average recombination rates and the cutoff for hotspot detection
+B97M_genome_recomb_rate <- mean(subset(B97_all_d, option == "spline")$rate, na.rm = T )
+B97M_genome_recomb_rate
+
+B97M_recombhotspot_cutoff <- 5 * B97M_genome_recomb_rate  #5-fold higher than genome average
+B97M_recombhotspot_cutoff
+
+# Identify the hotspots with mean recomnination rates 
+B97M_recomb_hot_genome <- B97M_mean_recomb_perwin %>%
+  ungroup() %>%
+  group_by(chr, window) %>%
+  filter(mean_recomb >= B97M_recombhotspot_cutoff)
+
+B97M_recomb_hot_genome$chr_Window <- paste(B97M_recomb_hot_genome$chr, B97M_recomb_hot_genome$window, sep = "_")
+
+dim(B97M_recomb_hot_genome)
+
+write.csv(B97M_recomb_hot_genome, "hotspot/B97M_recomb_hot_genome_0.2mb_5fold.csv", row.names = F )
+
+
+
+#Plot only for chr-specific spar options
+
+B97M_recom_chr <- ggplot() +
+    geom_rect( data=peri, aes(xmin=Start_Mb, xmax=End_Mb), ymin=-Inf, ymax=Inf, 
+    alpha = 0.3, fill = 'grey') +
+  geom_line(data = subset(B97_all_d, set == "B97M"), 
+            aes(x= Mb, y= rate), alpha =0.9, lwd =0.5, col = "blue") +
+  facet_wrap(  ~ chr, ncol = 2, scales = "free") +
+  theme_bw() +
+  labs(x= "Physical positions (Mb)" ,
+       y="Recombination rates (cM/Mb)", title="Chr-specific spline for B97M") +
+  theme(axis.text.y=element_text(size=8),axis.text.x=element_text(size=12),
+          axis.title=element_text(size=15), strip.text = element_text(size=12),
+        strip.background = element_blank(),
+        strip.text.y.left = element_text(angle = 0), legend.position = "none" ) +
+  theme(panel.grid.major = element_blank()) +
+  theme(panel.grid.minor = element_blank()) +
+  geom_hline(yintercept = B97M_recombhotspot_cutoff, linetype = "dashed", color = "grey40")
+
+
+png(filename = "plot/B97M_recom_chr_snp.png", width = 7, height = 7, units = "in",  res = 500 )
+B97M_recom_chr
+dev.off()
+
+
+```
+
+# Venn diagram for hotspot
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+# Get the number of rows in B97F_recomb_hot_genome$chr_Window
+num_B97F_recomb_hot <- length(B97F_recomb_hot_genome$chr_Window)
+
+
+# Get the number of rows in B97M_recomb_hot_genome$chr_Window
+num_B97M_recomb_hot <- length(B97M_recomb_hot_genome$chr_Window)
+
+
+# Find the common elements between the two vectors.
+common_B97_recomb_hot_genom <- intersect(B97M_recomb_hot_genome$chr_Window, B97F_recomb_hot_genome$chr_Window)
+
+# Get the number of rows in common_elements
+num_common_B97_recomb_hot <- length(common_B97_recomb_hot_genom)
+
+# Display the number of rows in each vector
+print(num_B97F_recomb_hot)
+print(num_B97M_recomb_hot)
+print(num_common_B97_recomb_hot)
+
+
+# Display the common elements.
+common_B97_recomb_hot_genom
+
+#Extract counts
+
+venn_B97_recomb_hot_genome <- venneuler(c(M = num_B97M_recomb_hot-num_common_B97_recomb_hot,
+                                          F = num_B97F_recomb_hot-num_common_B97_recomb_hot,
+                                          "F&M" = num_common_B97_recomb_hot))
+
+
+
+venn_B97_recomb_hot_genome$labels <- c("", "")
+
+venn_B97_recomb_hot_genome$colors <- c(0.7, 0)
+
+
+
+par(mgp=c(2.3,0.8,0))
+
+# Save venn diagram figure
+
+png(filename = "hotspot/B97_venn_recomb_hot_spline.png", width = 3, height = 2, units = "in",  res = 300 )
+par(cex= 2.5) 
+par(mar=c(0,0,0,0))
+plot(venn_B97_recomb_hot_genome) # or add main="B97" if necessary  
+
+text(0.2, 0.5, labels = as.character(num_B97F_recomb_hot-num_common_B97_recomb_hot), col = "red2")
+text(0.8, 0.5, labels = as.character(num_B97M_recomb_hot-num_common_B97_recomb_hot), col = "blue2")
+text(0.46, 0.53, num_common_B97_recomb_hot, col = "purple1")
+dev.off()
+
+
+
+```
+
+# Contrastspot for F/M
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97/hotspot/")
+
+# hotspot using recombination rates (adjust window size!) 
+
+# Group by chromosome and window (0.2Mb)
+B97_phys_grouped <- B97_all %>%
+  dplyr::group_by(chr, set) %>%
+  dplyr::mutate(window = ceiling(phys / 200000)) %>%
+  dplyr::group_by(window, .add = TRUE)
+
+
+# First, remove the NA values from the "spline" column.
+B97_phys_grouped2 <- B97_phys_grouped[!is.na(B97_phys_grouped$spline), ]
+
+# Group by "chr" and "window", and calculate the average spline per group.
+B97_mean_recomb_perwin <- B97_phys_grouped2 %>%
+  dplyr::group_by(set, chr, window) %>%
+  dplyr::summarize(mean_recomb = mean(spline))
+
+
+# Calculate the start and end positions of the windows based on the "window" column.
+window_size_mb <- 0.2  # Define the window size in Mb
+
+B97_mean_recomb_perwin_pos <- B97_mean_recomb_perwin %>%
+  mutate(
+    start = (window - 1) * window_size_mb,
+    end = window * window_size_mb
+  )
+
+#Split into two columns for two sets
+B97_mean_recomb_perwinset <- B97_mean_recomb_perwin_pos %>%
+  pivot_wider(names_from = set, values_from = mean_recomb)
+
+#Convert negative values to 0
+B97_mean_recomb_perwinset$B97F[B97_mean_recomb_perwinset$B97F < 0] <- 0
+B97_mean_recomb_perwinset$B97M[B97_mean_recomb_perwinset$B97M < 0] <- 0
+
+# Genome average 
+B97_genome_recomb_rate <- mean(B97_all$spline, na.rm = T )
+B97_genome_recomb_rate
+
+#cutoff for general hotspots
+B97_recombhotspot_cutoff <- 5 * B97_genome_recomb_rate  #5-fold higher than genome average
+B97_recombhotspot_cutoff
+
+
+# Extract FM hotspots (5 fold, higher than 1/2 genome average, whether it is general hotspots)
+B97_FM_hotspot <- B97_mean_recomb_perwinset %>%
+  filter((B97F > 5 * B97M | B97M > 5 * B97F) & 
+         (B97F > B97_genome_recomb_rate/2 & B97M > B97_genome_recomb_rate/2)) %>%
+  mutate(
+    FM_ratio = ifelse(B97F > B97M, (B97F + 0.00001) / (B97M + 0.00001), -((B97M + 0.00001) / (B97F + 0.00001))),
+    #if F>M, the ratio is positive but F<M it will be negative.
+    general_hotspot = ifelse(B97F > B97_recombhotspot_cutoff | B97M > B97_recombhotspot_cutoff, 
+                             ifelse(B97F > B97M, "F", "M"), "")
+  )
+
+
+
+colnames(B97_FM_hotspot)[5:6] <- c("F", "M") 
+
+# Sava the FM hotspot results
+write.csv(B97_FM_hotspot, "B97_FM_contrastspot.csv", row.names = F )
+
+
+# Count rows with positive FM_ratio
+Count_FoverM <- sum(B97_FM_hotspot$FM_ratio > 0)
+Count_FoverM
+
+# Count rows with negative FM_ratio
+Count_MoverF <- sum(B97_FM_hotspot$FM_ratio < 0)
+Count_MoverF
+
+
+# Create a vector to store the counts
+counts <- c(positive = Count_FoverM, negative = Count_MoverF)
+
+
+# Filter the data for Female higher and Male higher separately
+female_higher <- B97_FM_hotspot %>%
+  filter(FM_ratio > 0)
+
+male_higher <- B97_FM_hotspot %>%
+  filter(FM_ratio < 0)
+
+# Create a function to calculate the counts for each category in general_hotspot
+count_categories <- function(data, group_name) {
+  data %>%
+    dplyr::group_by(general_hotspot) %>%
+    dplyr::summarise(count = n()) %>%
+    dplyr::mutate(general_hotspot = ifelse(general_hotspot == "", "no general hotspot", general_hotspot),
+           group = group_name,
+           percent = count / sum(count))
+}
+
+# Calculate counts for Female higher and Male higher
+female_counts <- count_categories(female_higher, "Female higher")
+male_counts <- count_categories(male_higher, "Male higher")
+
+# Combine the data and create a new category for "no general hotspot" within each group
+combined_counts <- rbind(
+  female_counts %>% mutate(general_hotspot_grouped = paste(general_hotspot, " (Female higher)", sep = "")),
+  male_counts %>% mutate(general_hotspot_grouped = paste(general_hotspot, " (Male higher)", sep = ""))
+)
+
+
+
+# Create the stacked bar plot using ggplot2
+FM_hot_B97 <- ggplot(combined_counts, aes(x = group, y = count, fill = general_hotspot_grouped)) +
+  geom_bar(stat = "identity") +
+  labs(
+    x = "",
+    y = "Number of recombination hotspots (F vs M)",
+    fill = "General Hotspot",
+    title = "B97"
+  ) +
+  theme_classic() +
+  scale_fill_manual(values = c( "red", "blue", "pink", "skyblue")) + #Check manually
+    theme(
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 13),
+    axis.title = element_text(size = 15),
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(size = 15)
+  )
+
+
+FM_hot_B97
+
+#"Dark red and blue indicate general recombination hotspots that are 5-fold higher than the genome average."
+
+
+png(filename = "FM_hot_B97.png", width = 3.2, height = 5.5, units = "in",  res = 300 )
+
+FM_hot_B97
+
+dev.off()
+
+
+####
+
+
+
+
+# Create a heatmap frame for chromosomes 1 to 10
+heatmap_frame <- expand.grid(chr = as.character(c("10", "9", "8", "7", "6", "5",
+                                                 "4", "3", "2", "1")))  # Create a data frame with all chromosomes 1 to 10
+
+# Create a heatmap of Female higher and Male higher hotspots per chromosome (chr) and window
+heatmap_data <- B97_FM_hotspot %>%
+  mutate(group = ifelse(FM_ratio > 0, "Female higher", "Male higher"),
+         chr = factor(chr, levels = as.character(c("10", "9", "8", "7", "6", "5",
+                                                 "4", "3", "2", "1"))))  # Ensure proper chromosome order
+
+# Define the coordinates for horizontal lines between chromosomes
+chr_lines <- data.frame(yintercept = 1:10 - 0.5)
+
+heatmap_plot <- ggplot() +
+  geom_tile(data = heatmap_frame, aes(x = 0.5, y = chr), fill = "white") +  # Create the heatmap frame
+  geom_tile(data = heatmap_data, aes(x = window, y = chr, fill = group)) +  # Overlay the actual heatmap
+  geom_hline(data = chr_lines, aes(yintercept = yintercept), color = "grey", size = 0.5) + 
+  labs(
+    x = "Window",
+    y = "Chromosome",
+    fill = "Group",
+    title = "Female higher and Male higher hotspots (B97)"
+  ) +
+  scale_fill_manual(values = c("red", "blue")) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title = element_text(size = 15),
+    plot.title = element_text(size = 15),
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_y_discrete(breaks = 1:10)  # Label all 10 chromosomes
+
+# Print the heatmap
+print(heatmap_plot)
+
+png(filename = "FM_hot_heatmap_B97.png", width = 6, height = 6.5, units = "in",  res = 300 )
+
+heatmap_plot
+
+dev.off()
+
+
+
+################
+# Think about how to plot the heatmap for all lines but differently from the general hotspots.
+
+
+
+```
+
+# Recombination rate using ggplot2
+
+```{r}
+
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+peri <- read.csv("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/CO/ZmB73V5_heterochromatin regions.csv")
+
+B97_all <- read.table("B97_mareyout.chr_snp.txt", sep = " " , header = TRUE )
+B97_all$Mb <- B97_all$phys/1000000
+
+str(B97_all)
+colnames(B97_all)[2] <- "chr" 
+#B97_all  <- as.data.frame(lapply(B97_all, gsub, pattern = "Chromosome ", replacement = ""))
+B97_all$chr <- sub("Chromosome ", "", B97_all$chr)
+class(B97_all$chr)
+str(B97_all)
+
+B97_all$chr <- as.integer(B97_all$chr)
+
+
+########################
+# Extract genetic distance (cM) per chr per set
+
+cM_per_set_chr <- B97_all %>%
+  dplyr::group_by(set, chr) %>%
+  dplyr::summarise(max_gen = max(gen))
+
+cM_per_Set <-  cM_per_set_chr %>%
+  dplyr::group_by(set) %>%
+  dplyr::summarise(sum_cM = sum(max_gen))
+
+########################
+
+## Plotting cM
+
+
+
+### different y axis
+B97_CM_y <- ggplot() +
+    geom_rect( data=peri, aes(xmin=Start_Mb, xmax=End_Mb), ymin=-Inf, ymax=Inf, 
+    alpha = 0.3, fill = 'grey') +
+  geom_point(data =B97_all, aes(x= Mb, y= gen, col = set), alpha =0.4, lwd =0.3) +
+  facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme_bw() +
+  labs(x= "Physical positions (Mb)" ,
+       y="Genetic distance (cM)", title="B97") +
+  theme(axis.text.y=element_text(size=8),axis.text.x=element_text(size=12),
+          axis.title=element_text(size=15), strip.text = element_text(size=12),
+        strip.background = element_blank(),
+        strip.text.y.left = element_text(angle = 0),
+          legend.text = element_text(size=12),legend.title = element_text(size=13)) +
+  scale_color_manual(values=c('red3','blue4'), name = "") +
+  theme(panel.grid.major = element_blank()) +
+  theme(panel.grid.minor = element_blank()) 
+
+
+png(filename = "plot/B97_CM_y.png",  width = 8.3, height = 7, units = "in",  res = 500 )
+B97_CM_y
+dev.off()
+
+
+
+## Plotting recombination rates
+
+
+
+### combo plot
+B97_recomb_combo <- ggplot() +
+    geom_rect( data=peri, aes(xmin=Start_Mb, xmax=End_Mb), ymin=-Inf, ymax=Inf, 
+    alpha = 0.3, fill = 'grey') +
+  geom_line(data = subset(B97_all, spline >= 0), aes(x= Mb, y= spline*20, col = set), alpha =0.8, lwd =0.4) +
+   # geom_area(data = subset(B97_all, spline >= 0), aes(x= Mb, y= spline*20, color = set, fill = set, group = set), 
+  #          position = position_dodge(),alpha =0.4, size = 0.3) +
+  geom_point(data =B97_all, aes(x= Mb, y= gen, col = set), alpha =0.1, size = 0.5) +
+
+  facet_wrap( ~ chr, ncol = 2, scales = "free") +
+  theme_bw() +
+  labs(x= "Physical positions (Mb)" ,
+       y="Genetic distance (cM)", title="B97") +
+    scale_y_continuous(sec.axis = sec_axis(~ . / 20, name = "Recombination rates (cM/Mb)"))  +
+  theme(axis.text.y = element_text(size = 8),
+        axis.text.x = element_text(size = 9),
+        axis.title = element_text(size = 15),
+        strip.text = element_text(size = 12),
+        strip.background = element_blank(),
+        strip.text.y.left = element_text(angle = 0),
+        legend.text = element_text(size = 12),
+        legend.title = element_blank(),
+        legend.position ="none", # adjust these values to position the legend where you want
+        legend.justification = c(1, 0),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  scale_color_manual(values=c('red2','blue4')) +
+  scale_fill_manual(values=c('red2','blue4')) 
+
+
+png(filename = "plot/B97_recomb_combo_spline_chr.png", width = 8, height = 7, units = "in",  res = 500 )
+B97_recomb_combo
+dev.off()
+
+
+
+
+```
+
+# crossover counts
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97/plot")
+
+#Count the number of obligate crossovers for each individual
+
+B97F_nxo_df <- as.data.frame(B97F_nxo) 
+B97F_nxo_df$set <- "B97F"
+
+B97M_nxo_df <- as.data.frame(B97M_nxo) 
+B97M_nxo_df$set <- "B97M"
+
+B97_nxo <- rbind(B97F_nxo_df, B97M_nxo_df)
+
+colnames(B97_nxo) <- c("1", "2", "3", "4", "5",
+                        "6", "7", "8", "9", "10", "set")
+
+
+B97_nxo_d <- melt(B97_nxo, id = "set")
+colnames(B97_nxo_d) <- c("set", "chr", "CO")
+
+
+
+B97_nxo_plot <- ggplot(B97_nxo_d, aes(x= set, y = CO, fill = set)) +
+  geom_violin(trim = T, bw = 0.4, alpha =0.8) +
+  stat_summary(fun.data=mean_sd, geom="pointrange", color= "white", size = 0.3) +
+  theme_bw() +
+    labs(y="Number of crossover", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COcount.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_nxo_plot
+dev.off()
+
+
+#bar
+
+B97_nxo_sum <- summarySE(B97_nxo_d, measurevar = "CO", groupvars = c("set", "chr"), na.rm =T  )
+B97_nxo_sum
+
+B97_nxo_bar <- ggplot(B97_nxo_sum, aes(x= set, y = CO , fill = set)) +
+  geom_bar(position=position_dodge(), stat="identity", color="grey20") +
+  theme_bw() +
+    labs(y="Number of crossover", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=11, angle = 45, hjust=1 ),
+          strip.background = element_blank(),
+          axis.title=element_text(size=16), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+      geom_errorbar(aes(ymin=CO-se, ymax=CO+se),
+                  size=.3, color="grey20",
+                  width=.2,                    
+                  position=position_dodge(.9)) +
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+png(filename = "B97_nxo_bar.png", width = 2, height = 7.5, units = "in",  res = 500 )
+B97_nxo_bar
+dev.off()
+
+
+# CO count per meiosis
+
+B97_nxopm <- ggplot(B97_nxo_d, aes(x= set, y = CO , fill = set)) +
+  geom_violin(trim = T, bw = 0.4, alpha =0.8) +
+  stat_summary(fun.data=mean_sd, geom="pointrange", color= "white", size = 0.5) +
+  theme_bw() +
+    labs(y="Number of crossovers", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+  
+  geom_signif(comparisons = list(c("B97F", "B97M")), 
+              map_signif_level=TRUE, y_position = 6.2) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+png(filename = "B97_nxopm.png", width = 4, height = 5, units = "in",  res = 500 )
+B97_nxopm
+dev.off()
+
+
+
+# Number of crossover per individual
+
+library(ggsignif)
+
+B97_nxo$sum <- rowSums(B97_nxo[,1:10]) 
+
+B97_nxo_sum <- B97_nxo[,11:12]
+head(B97_nxo_sum)
+colnames(B97_nxo_sum) <- c("set", "CO")
+
+
+
+B97_nxo_sum.aov <- aov( CO ~ set, data = B97_nxo_sum)
+B97_nxo_sum_res <- HSD.test(B97_nxo_sum.aov, "set", group=TRUE)
+B97_nxo_sum_res$groups
+B97_nxo_sum_res$means
+
+shapiro.test(B97_nxo_sum.aov$residuals) #Normality?
+leveneTest(CO ~ set, data = B97_nxo_sum) #Equal variance?
+
+t.test(B97_nxo_sum$CO ~ B97_nxo_sum$set)
+
+B97_nxo_sump <- ggplot(B97_nxo_sum, aes(x= set, y = CO, fill = set)) +
+  geom_violin(trim = T, bw = 1, alpha =0.8) +
+  stat_summary(fun.data=mean_sd, geom="pointrange", color= "white", size = 0.6) +
+  theme_classic() +
+    labs(y="Number of crossover", title="B97", x="") +
+  geom_signif(comparisons = list(c("B97F", "B97M")), 
+              map_signif_level=TRUE) +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=11),
+          strip.background = element_blank(),
+          axis.title=element_text(size=16), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COsum.png", width = 2.2, height = 4, units = "in",  res = 500 )
+B97_nxo_sump
+dev.off()
+
+```
+
+# Recombination rate per meiosis
+
+```{r}
+
+# CO rate for each chr
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97/plot")
+
+
+B97_COrate <- ggplot(B97_all, aes(x= set, y = spline , fill = set)) +
+  geom_violin(trim = T, bw = 0.4, alpha =0.8) +
+  stat_summary(fun.data=mean_sd, geom="pointrange", color= "white", size = 0.3) +
+  theme_bw() +
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COrate.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_COrate
+dev.off()
+
+
+B97_COrate_ar <- ggplot(B97_all, aes(x= set, y = spline, color= set )) +
+  stat_summary(fun.data=mean_se, geom="errorbar", width = 0.2, alpha =0.7 ) +
+  stat_summary(fun.data=mean_se, geom="pointrange", size = 0.7, alpha =0.9) +
+  theme_bw() + 
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+      scale_color_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COrate_ar.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_COrate_ar
+dev.off()
+
+
+B97_COrate_box <- ggplot(B97_all, aes(x= set, y = spline , fill = set)) +
+  geom_boxplot(alpha = .7) +
+  theme_bw() +
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COrate_box.png", width = 3, height = 8.5, units = "in",  res = 500 )
+B97_COrate_box
+dev.off()
+
+
+#bar
+B97_CO <- B97_all
+B97_CO$chr <- as.factor(B97_CO$chr)
+head(B97_CO)
+
+B97_CO.aov <- aov( spline ~ set * chr, data = B97_CO)
+B97_CO_res <- HSD.test(B97_CO.aov, c("set", "chr"), group=TRUE)
+B97_CO_res$groups
+
+#plot(B97_CO.aov$residuals)
+
+shapiro.test(B97_CO.aov$residuals[0:5000]) #Normality?
+leveneTest(spline ~ set*chr, data = B97_CO) #Equal variance?
+
+#B97_CO.kru_post <- dunnTest(spline ~ set | chr, data = B97_CO, method="bh")#Non-parametric KW test
+#B97_CO.kru_post
+
+#B97_CO.fit = aov(spline ~ set*chr + Error(mkr), data = B97_CO) #Nested Anova
+#summary(B97_CO.fit)
+
+
+B97_CO_sum <- summarySE(B97_CO, measurevar = "spline", groupvars = c("set", "chr"), na.rm =T  )
+B97_CO_sum
+
+B97_COrate_bar <- ggplot(B97_CO_sum, aes(x= set, y = spline , fill = set)) +
+  geom_bar(position=position_dodge(), stat="identity", color="grey20", alpha =0.8) +
+  theme_bw() +
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9), axis.text.x=element_blank(), axis.ticks.x = element_blank(),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "right" , legend.title=element_blank(), legend.text=element_text(size=11)) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+      geom_errorbar(aes(ymin=spline-se, ymax=spline+se),
+                  size=.3, color="grey10",
+                  width=.2,                    
+                  position=position_dodge(.9)) +
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+png(filename = "B97_COrate_bar.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_COrate_bar
+dev.off()
+
+
+# CO rate per meiosis
+
+B97_COratepm <- ggplot(B97_all, aes(x= set, y = spline , fill = set)) +
+  geom_violin(trim = T, bw = 0.4, alpha =0.8) +
+  stat_summary(fun.data=mean_sd, geom="pointrange", color= "white", size = 0.5) +
+  theme_bw() +
+    labs(y="Recombination rate per meiosis", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+png(filename = "B97_COratepm.png", width = 4, height = 5, units = "in",  res = 500 )
+B97_COratepm
+dev.off()
+
+#bar
+
+B97_COpm_sum <- summarySE(B97_CO, measurevar = "spline", groupvars = c("set"), na.rm =T  )
+B97_COpm_sum
+
+B97_COratepm_bar <- ggplot(B97_COpm_sum, aes(x= set, y = spline , fill = set)) +
+  geom_bar(position=position_dodge(), stat="identity", color="grey20") +
+  theme_bw() +
+    labs(y="Recombination rate per meiosis", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12 ),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+      geom_errorbar(aes(ymin=spline-se, ymax=spline+se),
+                  size=.3, color="grey20",
+                  width=.2,                    
+                  position=position_dodge(.9)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+png(filename = "B97_COratepm_bar.png", width = 4, height = 6, units = "in",  res = 500 )
+B97_COratepm_bar
+dev.off()
+
+```
+
+# Genetic distance (cM) per meiosis
+
+```{r}
+
+# CO rate for each chr
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97/plot")
+
+head(B97_all)
+
+B97_gen <- ggplot(B97_all, aes(x= set, y = gen , fill = set)) +
+  geom_violin(trim = T, bw = 10, alpha =0.8) +
+  stat_summary(fun.data=mean_sd, geom="pointrange", color= "white", size = 0.3) +
+  theme_bw() +
+    labs(y="Genetic distance (cM)", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_gen.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_gen
+dev.off()
+
+
+B97_COrate_ar <- ggplot(B97_all, aes(x= set, y = spline, color= set )) +
+  stat_summary(fun.data=mean_se, geom="errorbar", width = 0.2, alpha =0.7 ) +
+  stat_summary(fun.data=mean_se, geom="pointrange", size = 0.7, alpha =0.9) +
+  theme_bw() + 
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+      scale_color_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COrate_ar.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_COrate_ar
+dev.off()
+
+
+B97_COrate_box <- ggplot(B97_all, aes(x= set, y = spline , fill = set)) +
+  geom_boxplot(alpha = .7) +
+  theme_bw() +
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9),axis.text.x=element_text(size=12),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "none" ) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+png(filename = "B97_COrate_box.png", width = 3, height = 8.5, units = "in",  res = 500 )
+B97_COrate_box
+dev.off()
+
+
+#bar
+B97_CO <- B97_all
+B97_CO$chr <- as.factor(B97_CO$chr)
+head(B97_CO)
+
+B97_CO.aov <- aov( spline ~ set * chr, data = B97_CO)
+B97_CO_res <- HSD.test(B97_CO.aov, c("set", "chr"), group=TRUE)
+B97_CO_res$groups
+
+#plot(B97_CO.aov$residuals)
+
+shapiro.test(B97_CO.aov$residuals[0:5000]) #Normality?
+leveneTest(spline ~ set*chr, data = B97_CO) #Equal variance?
+
+#B97_CO.kru_post <- dunnTest(spline ~ set | chr, data = B97_CO, method="bh")#Non-parametric KW test
+#B97_CO.kru_post
+
+#B97_CO.fit = aov(spline ~ set*chr + Error(mkr), data = B97_CO) #Nested Anova
+#summary(B97_CO.fit)
+
+
+B97_CO_sum <- summarySE(B97_CO, measurevar = "spline", groupvars = c("set", "chr"), na.rm =T  )
+B97_CO_sum
+
+B97_COrate_bar <- ggplot(B97_CO_sum, aes(x= set, y = spline , fill = set)) +
+  geom_bar(position=position_dodge(), stat="identity", color="grey20", alpha =0.8) +
+  theme_bw() +
+    labs(y="Recombination rate", title="B97", x="") +
+    theme(axis.text.y=element_text(size=9), axis.text.x=element_blank(), axis.ticks.x = element_blank(),
+          strip.background = element_blank(),
+          axis.title=element_text(size=17), strip.text = element_text(size=12),
+          legend.position = "right" , legend.title=element_blank(), legend.text=element_text(size=11)) +
+    scale_fill_manual(values=c("red2", "blue4"),
+                      breaks=c("B97F", "B97M"))+
+      geom_errorbar(aes(ymin=spline-se, ymax=spline+se),
+                  size=.3, color="grey10",
+                  width=.2,                    
+                  position=position_dodge(.9)) +
+   facet_wrap( ~ chr, ncol = 2, scales = "free_y") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+
+png(filename = "B97_COrate_bar.png", width = 3, height = 7.5, units = "in",  res = 500 )
+B97_COrate_bar
+dev.off()
+
+```
+
+# Onemap (just to validate by comparing mapping results with one from r/qtl)
+
+```{r}
+setwd("C:/Users/Gwonjin Lee/OneDrive - University of Florida/Project/Maize/GBS_analysis/linkage/B97")
+
+#B97F
+
+## SNP data processing for onemap
+
+# Load ABH file generated from vcf using Tassel
+B97F_ABH <- read.csv("B97F_imputed.csv", header = F)
+tB97F_ABH <- t(B97F_ABH[-c(2,3),])
+
+tB97F_ABH <- as.data.frame(tB97F_ABH)
+
+# add chr
+tB97F_ABH$CHROM <- sub("_.*", "", tB97F_ABH$`1` ) 
+#tB97F_ABH$CHROM <- sub("S", "Chr0", tB97F_ABH$CHROM ) 
+#tB97F_ABH$CHROM <- sub("010", "10", tB97F_ABH$CHROM ) 
+CHR_B97F <- t(tB97F_ABH$CHROM)[-1]
+
+
+# add pos
+tB97F_ABH$POS <- sub(".*_", "", tB97F_ABH$`1` ) 
+POS_B97F <- t(tB97F_ABH$POS)[-1]
+
+# Export pos info table
+B97F_CP <- t(tB97F_ABH[,(ncol(tB97F_ABH)-1):ncol(tB97F_ABH)])[,-1]
+write.table(B97F_CP, file = "B97F_CP.txt", sep = "\t", col.names = F, quote = F )
+
+# ABH form -> a/ab form if you want to use the onemap form and add seg type
+
+B97F_input <- tB97F_ABH[,-((ncol(tB97F_ABH)-1):ncol(tB97F_ABH))]
+
+B97F_input1  <- data.frame(lapply(B97F_input[-1,], gsub, pattern = "AA", replacement = "a"))
+B97F_input1  <- data.frame(lapply(B97F_input1, gsub, pattern = "BB", replacement = "-"))
+B97F_input1  <- data.frame(lapply(B97F_input1, gsub, pattern = "AB", replacement = "ab"))
+B97F_input1  <- data.frame(lapply(B97F_input1, gsub, pattern = "chr", replacement = "*chr"))
+
+names(B97F_input) <- names(B97F_input1)
+B97F_input2 <- rbind(B97F_input[1,], B97F_input1)
+
+# Add seg type
+B97F_input2$X2 <- "A.H" 
+
+B97F_input3 <-  B97F_input2 %>%
+  relocate(X2, .before = X4)
+
+write.table(B97F_input3, file = "B97F_formapinput.txt", sep = "\t", col.names = F, row.names = F, quote = F )
+
+dim(B97F_input3) # use genotype-1 and individual-2 for the header
+B97F_filled_argmax # compare the numbers
+
+###############################################################################################
+#### Add CHROM and POS + header in the notepad++ using "B97F_formapinput.txt and B97F_CP.txt
+#### something like this
+#### data type f2 backcross
+#### 91	9134	1	1	0
+#### remove Genotype	A.H	in the first row
+
+###############################################################################################
+
+B97F_mapmaker <- read_onemap(inputfile="B97F_onemapinput.txt")
+
+
+#plot(B97F_mapmaker)
+#plot_by_segreg_type(B97F_mapmaker)
+
+# Find redundant markers
+bins_B97F <- find_bins(B97F_mapmaker, exact = F)
+bins_B97F
+
+bins_data_B97F <- create_data_bins(B97F_mapmaker, bins_B97F)
+bins_data_B97F
+
+#write_onemap_raw(bins_data_B97F, file.name = "B97F_bin.raw")
+
+B97F_test <- test_segregation(bins_data_B97F)
+
+class(B97F_test)
+
+#print(B97F_test)
+Bonferroni_alpha(B97F_test)
+plot(B97F_test)
+select_segreg(B97F_test)
+select_segreg(B97F_test, distorted = TRUE)
+
+no_dist_B97F <- select_segreg(B97F_test, distorted = FALSE, numbers = TRUE) #to show the markers numbers without segregation distortion
+#no_dist_B97F
+
+dist_B97F <- select_segreg(B97F_test, distorted = TRUE, numbers = TRUE) #to show the markers numbers with segregation distortion
+#dist_B97F
+
+(LOD_sug <- suggest_lod(bins_data_B97F))
+
+# two-point analysis
+twopts_B97F <- rf_2pts(input.obj = bins_data_B97F, LOD = LOD_sug, max.rf = 0.5)
+
+
+
+#mark_all_B97F <- make_seq(twopts_B97F, LOD = LOD_sug, max.rf = 0.5)
+
+
+#### For individual LGs (chromosomes)
+
+B97F_CHR1 <- make_seq(twopts_B97F, "chr1")
+B97F_CHR2 <- make_seq(twopts_B97F, "chr2")
+B97F_CHR3 <- make_seq(twopts_B97F, "chr3")
+B97F_CHR4 <- make_seq(twopts_B97F, "chr4")
+B97F_CHR5 <- make_seq(twopts_B97F, "chr5")
+B97F_CHR6 <- make_seq(twopts_B97F, "chr6")
+B97F_CHR7 <- make_seq(twopts_B97F, "chr7")
+B97F_CHR8 <- make_seq(twopts_B97F, "chr8")
+B97F_CHR9 <- make_seq(twopts_B97F, "chr9")
+B97F_CHR10 <- make_seq(twopts_B97F, "chr10")
+
+
+#B97F_CHR1.rec <- record(B97F_CHR1, hmm = TRUE)
+B97F_CHR1_batch_size <- pick_batch_sizes(input.seq = B97F_CHR1, 
+                               size = 50, 
+                               overlap = 30, 
+                               around = 10)
+
+B97F_CHR1_batch_size
+
+
+#B97F_CHR1_rec_par <- record(input.seq = B97F_CHR1,
+#                   phase_cores = 4, 
+#                   size = B97F_CHR1_batch_size, 
+#                   overlap = 30)
+
+#B97F_CHR1_rec_par
+
+
+# The option, tol = 1e-3, global_error = 0.2 generated lowest number of cM but the plot looks weird.
+
+B97F_CHR1_map <- onemap::map(B97F_CHR1)
+B97F_CHR1_map
+
+B97F_CHR2_map <- onemap::map(B97F_CHR2)
+B97F_CHR3_map <- onemap::map(B97F_CHR3)
+B97F_CHR4_map <- onemap::map(B97F_CHR4)
+B97F_CHR5_map <- onemap::map(B97F_CHR5)
+B97F_CHR6_map <- onemap::map(B97F_CHR6)
+B97F_CHR7_map <- onemap::map(B97F_CHR7)
+B97F_CHR8_map <- onemap::map(B97F_CHR8)
+B97F_CHR9_map <- onemap::map(B97F_CHR9)
+B97F_CHR10_map <- onemap::map(B97F_CHR10)
+
+#marker_type(B97F_CHR1_map)
+#rf_graph_table(B97F_CHR1_map)
+
+#merge maps
+B97F_maps_list <- list(B97F_CHR1_map, B97F_CHR2_map, B97F_CHR3_map, B97F_CHR4_map, B97F_CHR5_map, 
+                  B97F_CHR6_map, B97F_CHR7_map, B97F_CHR8_map, B97F_CHR9_map, B97F_CHR10_map)
+
+#plot maps
+draw_map(B97F_maps_list)
+
+draw_map2(B97F_maps_list, output = "plot/B97F_onemap.png")
+
+#write_map(B97F_maps_list, "B97F_onemap.txt")
+
+##############################################################################################################
+##############################################################################################################
+
+
+#B97M
+
+## SNP data processing for onemap
+
+# Load ABH file generated from vcf using Tassel
+B97M_ABH <- read.csv("B97M_imputed.csv", header = F)
+tB97M_ABH <- t(B97M_ABH[-c(2,3),])
+
+tB97M_ABH <- as.data.frame(tB97M_ABH)
+
+# add chr
+tB97M_ABH$CHROM <- sub("_.*", "", tB97M_ABH$`1` ) 
+#tB97M_ABH$CHROM <- sub("S", "Chr0", tB97M_ABH$CHROM ) 
+#tB97M_ABH$CHROM <- sub("010", "10", tB97M_ABH$CHROM ) 
+CHR_B97M <- t(tB97M_ABH$CHROM)[-1]
+
+
+# add pos
+tB97M_ABH$POS <- sub(".*_", "", tB97M_ABH$`1` ) 
+POS_B97M <- t(tB97M_ABH$POS)[-1]
+
+# Export pos info table
+B97M_CP <- t(tB97M_ABH[,(ncol(tB97M_ABH)-1):ncol(tB97M_ABH)])[,-1]
+write.table(B97M_CP, file = "B97M_CP.txt", sep = "\t", col.names = F, quote = F )
+
+# ABH form -> a/ab form if you want to use the onemap form and add seg type
+
+B97M_input <- tB97M_ABH[,-((ncol(tB97M_ABH)-1):ncol(tB97M_ABH))]
+
+B97M_input1  <- data.frame(lapply(B97M_input[-1,], gsub, pattern = "AA", replacement = "a"))
+B97M_input1  <- data.frame(lapply(B97M_input1, gsub, pattern = "BB", replacement = "-"))
+B97M_input1  <- data.frame(lapply(B97M_input1, gsub, pattern = "AB", replacement = "ab"))
+B97M_input1  <- data.frame(lapply(B97M_input1, gsub, pattern = "chr", replacement = "*chr"))
+
+names(B97M_input) <- names(B97M_input1)
+B97M_input2 <- rbind(B97M_input[1,], B97M_input1)
+
+# Add seg type
+B97M_input2$X2 <- "A.H" 
+
+B97M_input3 <-  B97M_input2 %>%
+  relocate(X2, .before = X4)
+
+write.table(B97M_input3, file = "B97M_formapinput.txt", sep = "\t", col.names = F, row.names = F, quote = F )
+
+dim(B97M_input3) # use genotype-1 and individual-2 for the header
+B97M_filled_argmax # compare the numbers
+
+###############################################################################################
+#### Add CHROM and POS + header in the notepad++ using "B97M_formapinput.txt and B97M_CP.txt
+#### something like this
+#### data type f2 backcross
+#### 91	9134	1	1	0
+#### remove Genotype	A.H	in the first row
+
+###############################################################################################
+
+B97M_mapmaker <- read_onemap(inputfile="B97M_onemapinput.txt")
+
+
+#plot(B97M_mapmaker)
+#plot_by_segreg_type(B97M_mapmaker)
+
+# Find redundant markers
+bins_B97M <- find_bins(B97M_mapmaker, exact = F)
+bins_B97M
+
+bins_data_B97M <- create_data_bins(B97M_mapmaker, bins_B97M)
+bins_data_B97M
+
+#write_onemap_raw(bins_data_B97M, file.name = "B97M_bin.raw")
+
+B97M_test <- test_segregation(bins_data_B97M)
+
+class(B97M_test)
+
+#print(B97M_test)
+Bonferroni_alpha(B97M_test)
+plot(B97M_test)
+select_segreg(B97M_test)
+select_segreg(B97M_test, distorted = TRUE)
+
+no_dist_B97M <- select_segreg(B97M_test, distorted = FALSE, numbers = TRUE) #to show the markers numbers without segregation distortion
+#no_dist_B97M
+
+dist_B97M <- select_segreg(B97M_test, distorted = TRUE, numbers = TRUE) #to show the markers numbers with segregation distortion
+#dist_B97M
+
+(LOD_sug <- suggest_lod(bins_data_B97M))
+
+# two-point analysis
+twopts_B97M <- rf_2pts(input.obj = bins_data_B97M, LOD = LOD_sug, max.rf = 0.5)
+
+
+
+#mark_all_B97M <- make_seq(twopts_B97M, LOD = LOD_sug, max.rf = 0.5)
+
+
+#### For individual LGs (chromosomes)
+
+B97M_CHR1 <- make_seq(twopts_B97M, "chr1")
+B97M_CHR2 <- make_seq(twopts_B97M, "chr2")
+B97M_CHR3 <- make_seq(twopts_B97M, "chr3")
+B97M_CHR4 <- make_seq(twopts_B97M, "chr4")
+B97M_CHR5 <- make_seq(twopts_B97M, "chr5")
+B97M_CHR6 <- make_seq(twopts_B97M, "chr6")
+B97M_CHR7 <- make_seq(twopts_B97M, "chr7")
+B97M_CHR8 <- make_seq(twopts_B97M, "chr8")
+B97M_CHR9 <- make_seq(twopts_B97M, "chr9")
+B97M_CHR10 <- make_seq(twopts_B97M, "chr10")
+
+
+#B97M_CHR1.rec <- record(B97M_CHR1, hmm = TRUE)
+B97M_CHR1_batch_size <- pick_batch_sizes(input.seq = B97M_CHR1, 
+                               size = 50, 
+                               overlap = 30, 
+                               around = 10)
+
+B97M_CHR1_batch_size
+
+
+#B97M_CHR1_rec_par <- record(input.seq = B97M_CHR1,
+#                   phase_cores = 4, 
+#                   size = B97M_CHR1_batch_size, 
+#                   overlap = 30)
+
+#B97M_CHR1_rec_par
+
+
+# The option, tol = 1e-3, global_error = 0.2 generated lowest number of cM but the plot looks weird.
+
+B97M_CHR1_map <- onemap::map(B97M_CHR1)
+B97M_CHR1_map
+
+B97M_CHR2_map <- onemap::map(B97M_CHR2)
+B97M_CHR3_map <- onemap::map(B97M_CHR3)
+B97M_CHR4_map <- onemap::map(B97M_CHR4)
+B97M_CHR5_map <- onemap::map(B97M_CHR5)
+B97M_CHR6_map <- onemap::map(B97M_CHR6)
+B97M_CHR7_map <- onemap::map(B97M_CHR7)
+B97M_CHR8_map <- onemap::map(B97M_CHR8)
+B97M_CHR9_map <- onemap::map(B97M_CHR9)
+B97M_CHR10_map <- onemap::map(B97M_CHR10)
+
+#marker_type(B97M_CHR1_map)
+#rf_graph_table(B97M_CHR1_map)
+
+#merge maps
+B97M_maps_list <- list(B97M_CHR1_map, B97M_CHR2_map, B97M_CHR3_map, B97M_CHR4_map, B97M_CHR5_map, 
+                  B97M_CHR6_map, B97M_CHR7_map, B97M_CHR8_map, B97M_CHR9_map, B97M_CHR10_map)
+
+#plot maps
+draw_map(B97M_maps_list)
+
+draw_map2(B97M_maps_list, output = "plot/B97M_onemap.png")
+
+#write_map(B97M_maps_list, "B97M_onemap.txt")
+```
+
+# GC contents
+
+```{r}
+
+# Load ABH file
+B97F_abh <- read.csv("B97F_phy.csv", header = T)
+B97F_abh <- as.data.frame(t(B97F_abh))
+
+# Set the column names of the data frame using the first row
+colnames(B97F_abh) <- as.character(B97F_abh[1,])
+
+# Remove the first row from the data frame
+B97F_abh <- B97F_abh[-1,]
+
+# Row names into the first column
+B97F_abh$SNP <- row.names(B97F_abh)
+
+# Extract only B97F genotypes
+B97F_hmp <- B97_filter[,c(-12, -c(106:ncol(B97_filter)))]
+
+
+# Identify the SNPs that are present in both dataframes
+common_snps <- intersect(B97F_hmp$rs, B97F_abh$SNP)
+
+# Subset ABH file and HapMap file to common SNPs
+B97F_abh2 <- B97F_abh[B97F_abh$SNP %in% common_snps,][,c(-1,-2,-ncol(B97F_abh))]
+
+B97F_hmp2 <- B97F_hmp[B97F_hmp$rs %in% common_snps,]
+
+###################################
+# subset the HMP data only for genotype matrix
+hmp <- B97F_hmp2[,c(-3:-11)]
+
+# Define a function to replace "N" with nucleotides from non-missing genotypes
+replace_n_with_nucleotides <- function(alleles, genotypes) {
+  # Extract unique nucleotides from non-missing genotypes
+  nucleotides <- unique(substr(genotypes[!is.na(genotypes)], 1, 1))
+  # Replace "N" with nucleotides
+  alleles[alleles == "NN"] <- paste0(sort(nucleotides), collapse = "/")
+  return(alleles)
+}
+
+
+# replace NN with NA in hmp
+hmp[hmp == "NN"] <- NA
+
+# Define a function to generate the alleles column
+generate_alleles_column <- function(hmp) {
+  # Get the genotypes for each SNP
+  genotypes <- hmp[, 3:ncol(hmp)]
+  # Initialize an empty vector to store the alleles
+  alleles <- character(nrow(hmp))
+  # Loop over the SNPs
+  for (i in seq_len(nrow(hmp))) {
+    # Extract the unique alleles from the genotypes
+    unique_alleles <- unique(unlist(strsplit(as.character(genotypes[i, ]), split = "")))
+    # If there is only one unique allele, set both alleles to that allele
+    if (length(unique_alleles) == 1) {
+      alleles[i] <- paste(rep(unique_alleles, 2), collapse = "/")
+    } else {
+      # Otherwise, sort the alleles and concatenate them
+      alleles[i] <- paste(sort(unique_alleles), collapse = "/")
+    }
+  }
+  # Replace "N" with nucleotides from non-missing genotypes
+  alleles <- replace_n_with_nucleotides(alleles, genotypes)
+  # Return the alleles vector
+  return(alleles)
+}
+
+# Generate the alleles column
+hmp$alleles <- generate_alleles_column(hmp)
+
+#############
+# Example dataframe
+df <- data.frame(
+  col1 = c("AA", "AC", "CC", "GG", "CC"),
+  col2 = c("AC", "GG", "GG", "GG", "GG"),
+  col3 = c("CC", "CC", "CC", "CC", "CG")
+)
+
+
+
+##########
+
+
+
+
+
+
+# Create a new dataframe for the imputed HMP data
+imputed_hmp <- B97F_hmp2
+
+# Loop over each common SNP
+# Loop over each common SNP
+for (snp in common_snps) {
+  
+  # Find the corresponding row in the unimputed HMP dataframe
+  hmp_row <- B97F_hmp2[B97F_hmp2$rs == snp, ]
+  
+  # Find the corresponding row in the imputed ABH dataframe
+  abh_row <- B97F_abh2[B97F_abh2$Row.names == snp, ]
+  
+  # Determine the nucleotides for each allele based on the genotype call in the imputed ABH dataframe
+  if (nrow(abh_row) > 0) {
+    alleles <- substr(colnames(abh_row), 1, 1)
+    
+    # Impute missing genotypes based on genotype calls in the imputed ABH dataframe
+    for (i in 1:nrow(hmp_row)) {
+      if (is.na(hmp_row[i, 2])) {
+        if (abh_row[i, alleles[1]] == "A" && abh_row[i, alleles[2]] == "A") {
+          hmp_row[i, 2] <- "AA"
+        } else if (abh_row[i, alleles[1]] == "B" && abh_row[i, alleles[2]] == "B") {
+          hmp_row[i, 2] <- "BB"
+        } else {
+          hmp_row[i, 2] <- "AB"
+        }
+      }
+    }
+  }
+  
+  # Update the imputed HMP dataframe with the new genotype calls
+  imputed_hmp[imputed_hmp$SNP == snp, ] <- hmp_row
+  
+}
+
+# Save the imputed HMP dataframe to a file
+write.csv(imputed_hmp, "imputed_hmp.csv", row.names = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#############################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+library(stringr)
+
+# Load ABH file
+B97F_abh <- read.csv("B97F_phy.csv", header = T)
+B97F_abh <- as.data.frame(t(B97F_abh))
+
+# Set the column names of the data frame using the first row
+colnames(B97F_abh) <- as.character(B97F_abh[1,])
+
+# Remove the first row from the data frame
+B97F_abh <- B97F_abh[-1,]
+
+# Row names into the first column
+B97F_abh$SNP <- row.names(B97F_abh)
+
+# Make HapMap file to get SNP positions and alleles
+B97F_hmp <- B97_filter[,c(-12, -c(106:ncol(B97_filter)))]
+
+
+
+# Find SNPs present in both files
+common_snps <- intersect(B97F_abh$SNP, B97F_hmp$rs)
+if (length(common_snps) == 0) {
+  stop("Error: No common SNPs found between ABH and HapMap files.")
+}
+
+# Subset ABH file and HapMap file to common SNPs
+B97F_abh2 <- B97F_abh[B97F_abh$SNP %in% common_snps,][,-ncol(B97F_abh)]
+
+B97F_hmp2 <- B97F_hmp[B97F_hmp$rs %in% common_snps,]
+
+# Get SNP positions and alleles
+snp_pos <- B97F_hmp2$pos
+snp_alleles <- B97F_hmp2[,12:(ncol(B97F_hmp))]
+
+
+# Convert genotypes to HapMap format
+B97F_hmpgeno <- matrix("", nrow = nrow(B97F_abh2), ncol = ncol(B97F_abh2) - 2)
+
+for (i in 1:nrow(B97F_abh2)) {
+  for (j in 3:ncol(B97F_abh2)) {
+    if (B97F_abh2[i,j] == "AA") {
+      B97F_hmpgeno[i,j-2] <- paste(rep(substr(snp_alleles[i,j-2],1,1), 2), collapse="")
+    } else if (B97F_abh2[i,j] == "AB") {
+      B97F_hmpgeno[i,j-2] <- paste(substr(snp_alleles[i,j-2],1,1), substr(snp_alleles[i,j-2],2,2), sep="")
+    } else if (B97F_abh2[i,j] == "BB") {
+      B97F_hmpgeno[i,j-2] <- paste(rep(substr(snp_alleles[i,j-2],2,2), 2), collapse="")
+    } else {
+      B97F_hmpgeno[i,j-2] <- "NN"
+    }
+  }
+}
+
+dim(B97F_hmpgeno)
+
+# Write HapMap file
+B97F_hmp <- data.frame("rs"=B97F_abh$SNP, "alleles" = "NA", "chrom"=B97F_abh[1], "pos"=snp_pos, B97F_hmpgeno)
+
+colnames(B97F_hmp)[1:4] <- c("rs", "alleles", "chrom", "pos")
+colnames(B97F_hmp)[5:ncol(B97F_hmp)] <- colnames(B97F_abh2)[3:ncol(B97F_abh2)]
+
+write.table(B97F_hmp, file = "B97F_imputed_hmp.txt", quote = F, sep = "\t", row.names = F)
+
+
+
+
+
+
+
+###################################################################
+# calculate gc contents for each snp using hmp file
+
+
+head(B97_filter)[,c(1:12)]
+
+B97_filtered <- as.data.frame(B97_filter)
+
+
+GCcont <- function(x){
+  x$GC_F <- 0
+  for (i in 1:nrow(x)) {
+    gc_F <- sum(str_count(x[i,c(13:105)], "G|C"), na.rm = T ) #change the range using the last f column
+    total_F <- sum(str_count(x[i,c(13:105)], "A|G|C|T"), na.rm = T )
+    x$GC_F[i] <- gc_F*100/total_F
+  }
+
+    x$GC_M <- 0
+  for (i in 1:nrow(x)) {
+    gc_M <- sum(str_count(x[i,c(106:(ncol(x)-1))], "G|C"), na.rm = T ) #change the range using the first m column
+    total_M <- sum(str_count(x[i,c(106:(ncol(x)-1))], "A|G|C|T"), na.rm = T )
+    x$GC_M[i] <- gc_M*100/total_M
+  }
+  return(x)
+}
+
+
+B97_filtered <- GCcont(B97_filtered)
+
+dim(B97_filtered)
+
+B97_mareyout <- read.table("B97_mareyout.txt", sep = " " , header = TRUE )
+dim(B97_mareyout)
+
+
+#
+
+
+```
